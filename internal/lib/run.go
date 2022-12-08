@@ -5,13 +5,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/gobwas/glob"
 	"github.com/sourcegraph/go-lsp"
 )
+
+var methodRegexp = regexp.MustCompile(`\(\*?(.+)\)\.(.+)`)
 
 func Run(ctx context.Context, cfg RunConfig) (err error) {
 	if err := cfg.validate(); err != nil {
@@ -27,8 +32,9 @@ func Run(ctx context.Context, cfg RunConfig) (err error) {
 	if err != nil {
 		return err
 	}
+
 	defer func() {
-		err = r.Stop()
+		r.Stop()
 	}()
 
 	err = r.Walk()
@@ -85,6 +91,7 @@ func (r *runner) Walk() error {
 		if info == nil {
 			return nil
 		}
+
 		if info.IsDir() {
 			if strings.HasPrefix(info.Name(), ".") {
 				return filepath.SkipDir
@@ -107,17 +114,24 @@ func (r *runner) Walk() error {
 }
 
 func (r *runner) handleFile(filename string) error {
-	if strings.HasSuffix(filename, "_test.go") {
-		return nil
-	}
-
 	symbols, err := r.client.DocumentSymbol(r.ctx, filename)
 	if err != nil {
-		fmt.Errorf("failed to get symbols: %w", err)
+		return fmt.Errorf("failed to get symbols: %w", err)
 	}
 
 	var handleSymbol func(s *Symbol) error
 	handleSymbol = func(s *Symbol) error {
+		// Skip fields since they are too unreliable right now
+		if s.Kind == lsp.SKField {
+			return nil
+		}
+
+		isTest := strings.HasPrefix(s.Name, "Test") || strings.HasPrefix(s.Name, "Benchmark") || strings.HasPrefix(s.Name, "Example")
+		// Skip tests
+		if strings.HasSuffix(filename, "_test.go") && s.Kind == lsp.SKFunction && isTest {
+			return nil
+		}
+
 		base := s.Name
 		if s.Kind == lsp.SKMethod && strings.Contains(base, ".") {
 			// Struct methods' Name comes on the form  (MyType).MyMethod.
@@ -147,6 +161,13 @@ func (r *runner) handleFile(filename string) error {
 			}
 		}
 
+		if unused {
+			err := r.remove(filename, s)
+			if err != nil {
+				log.Printf("%+v", err)
+			}
+		}
+
 		if unused || testOnly {
 			e := usage{
 				Filename:   filename,
@@ -168,6 +189,35 @@ func (r *runner) handleFile(filename string) error {
 	for _, s := range symbols {
 		if err := handleSymbol(s); err != nil {
 			return err
+		}
+	}
+
+	return nil
+}
+
+func (r runner) remove(filename string, symbol *Symbol) error {
+	reference := symbol.Name
+	if symbol.Kind == lsp.SKMethod && strings.Contains(reference, ".") {
+		reference = string(methodRegexp.ReplaceAll([]byte(reference), []byte("$1.$2")))
+	}
+
+	script := fmt.Sprintf("rm %s", reference)
+
+	cmd := exec.Command("rf", script)
+	cmd.Dir = filepath.Join(r.cfg.WorkspaceDir, filepath.Dir(filename))
+
+	out, err := cmd.Output()
+
+	if err != nil {
+		if string(out) != "" {
+			fmt.Printf(string(out))
+		}
+
+		switch err := err.(type) {
+		case *exec.ExitError:
+			return fmt.Errorf("unable to execute remove %v: %s", script, string(err.Stderr))
+		default:
+			return fmt.Errorf("unable to execute remove %v: %w", script, err)
 		}
 	}
 

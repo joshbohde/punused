@@ -2,33 +2,58 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
-	"time"
+	"runtime/pprof"
+	"strings"
 
 	"github.com/bep/punused/internal/lib"
 )
 
+var (
+	cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+	wd         = flag.String("wd", "", "working directory for the project")
+)
+
 func main() {
-	// Default to "every go file in the workspace".
-	pattern := "**/*.go"
-	if len(os.Args) > 1 {
-		pattern = os.Args[1]
+	flag.Parse()
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Fatal(err)
+		}
+		_ = pprof.StartCPUProfile(f)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
+	// Set a default working directory
+	if *wd == "" {
+		*wd, _ = os.Getwd()
+	}
 
-	wd, _ := os.Getwd()
+	// Default to "every go file in the workspace".
+	pattern := "**/*.go"
+
+	args := flag.Args()
+
+	if len(args) > 0 {
+		pattern = strings.TrimPrefix(args[0], "./")
+	}
+
+	ctx := context.Background()
 
 	err := lib.Run(
 		ctx,
 		lib.RunConfig{
-			WorkspaceDir:    wd,
+			WorkspaceDir:    *wd,
 			FilenamePattern: pattern,
 			Out:             os.Stdout,
 		},
 	)
+
+	pprof.StopCPUProfile()
+
 	if err != nil {
 		log.Fatal(err)
 	}
